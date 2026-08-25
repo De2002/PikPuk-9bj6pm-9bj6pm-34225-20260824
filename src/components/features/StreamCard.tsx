@@ -1,7 +1,7 @@
 import { useEffect, useState, useRef, useCallback } from 'react';
 import { Moment, StreamPhase, TextSize, SPACES } from '@/types';
 import { calcReadingTime } from '@/lib/utils';
-import { audioEngine } from '@/lib/audioEngine';
+import { audioEngine, typingSound } from '@/lib/audioEngine';
 import { ExternalLink, Play, Pause } from 'lucide-react';
 
 interface Props {
@@ -15,28 +15,27 @@ interface Props {
   onPin: () => void;
   onLetGo: () => void;
   onAudioDuration?: (seconds: number) => void;
+  onVoiceFinished?: () => void;
 }
 
-// ── Tiny markdown renderer (bold, italic, links, headings, line breaks) ───────
+// ── Tiny markdown renderer ────────────────────────────────────────────────────
 function renderMarkdown(text: string): React.ReactNode[] {
   const lines = text.split('\n');
   return lines.map((line, li) => {
-    // Heading
     const h2 = line.match(/^## (.+)/);
     const h3 = line.match(/^### (.+)/);
     if (h2) return <p key={li} className="font-semibold text-[#f0ebe0] mb-1 mt-3 text-base">{h2[1]}</p>;
     if (h3) return <p key={li} className="font-medium text-[#f0ebe0]/80 mb-1 mt-2 text-sm">{h3[1]}</p>;
     if (line.trim() === '') return <br key={li} />;
 
-    // Inline: bold, italic, code, links
     const parts: React.ReactNode[] = [];
     let remaining = line;
     let key = 0;
     while (remaining.length > 0) {
-      const boldMatch  = remaining.match(/^\*\*(.+?)\*\*/);
+      const boldMatch   = remaining.match(/^\*\*(.+?)\*\*/);
       const italicMatch = remaining.match(/^_(.+?)_/);
-      const codeMatch  = remaining.match(/^`(.+?)`/);
-      const linkMatch  = remaining.match(/^\[(.+?)\]\((https?:\/\/[^\s)]+)\)/);
+      const codeMatch   = remaining.match(/^`(.+?)`/);
+      const linkMatch   = remaining.match(/^\[(.+?)\]\((https?:\/\/[^\s)]+)\)/);
 
       if (boldMatch) {
         parts.push(<strong key={key++} className="font-semibold text-[#f0ebe0]">{boldMatch[1]}</strong>);
@@ -50,8 +49,9 @@ function renderMarkdown(text: string): React.ReactNode[] {
       } else if (linkMatch) {
         parts.push(
           <a key={key++} href={linkMatch[2]} target="_blank" rel="noopener noreferrer"
-            className="underline underline-offset-2 text-[#93c5fd] hover:text-[#bfdbfe] transition-colors"
-          >{linkMatch[1]}</a>
+            className="underline underline-offset-2 text-[#93c5fd] hover:text-[#bfdbfe] transition-colors">
+            {linkMatch[1]}
+          </a>
         );
         remaining = remaining.slice(linkMatch[0].length);
       } else {
@@ -71,24 +71,61 @@ function renderMarkdown(text: string): React.ReactNode[] {
   });
 }
 
-// ── Typing effect for text-only moments ──────────────────────────────────────
-function useTypingReveal(text: string, active: boolean, charsPerMs = 0.055) {
+// ── Realistic typing reveal ───────────────────────────────────────────────────
+// Uses a natural-speed model: base chars/ms with:
+//   - burst runs (fast phrases)
+//   - micro-pauses at punctuation
+//   - occasional hesitations
+function useTypingReveal(text: string, active: boolean) {
   const [revealedChars, setRevealedChars] = useState(0);
   const rafRef = useRef<number>();
-  const startRef = useRef<number | null>(null);
+  const stateRef = useRef({ pos: 0, nextFire: 0, lastTypeSoundAt: 0 });
 
   useEffect(() => {
-    if (!active) { setRevealedChars(text.length); return; }
+    if (!active) {
+      setRevealedChars(text.length);
+      cancelAnimationFrame(rafRef.current!);
+      return;
+    }
     setRevealedChars(0);
-    startRef.current = null;
+    stateRef.current = { pos: 0, nextFire: performance.now() + 180, lastTypeSoundAt: 0 };
+
+    // Prime the typing sound
+    void typingSound.prime();
 
     const step = (ts: number) => {
-      if (startRef.current === null) startRef.current = ts;
-      const elapsed = ts - startRef.current;
-      const chars = Math.floor(elapsed * charsPerMs);
-      setRevealedChars(Math.min(chars, text.length));
-      if (chars < text.length) rafRef.current = requestAnimationFrame(step);
+      const s = stateRef.current;
+      if (ts < s.nextFire) { rafRef.current = requestAnimationFrame(step); return; }
+
+      const char = text[s.pos];
+      // Base interval: 38–62ms per character
+      let interval = 38 + Math.random() * 24;
+
+      // Punctuation pause
+      if ('.!?'.includes(char)) interval += 120 + Math.random() * 160;
+      else if (',;:'.includes(char)) interval += 60 + Math.random() * 80;
+      // Space can be fast (burst) or slightly slower
+      else if (char === ' ') interval = 20 + Math.random() * 35;
+      // Occasional natural hesitation (~6% chance before any char)
+      else if (Math.random() < 0.06) interval += 90 + Math.random() * 120;
+      // Burst run (~20% chance – fast consecutive chars)
+      else if (Math.random() < 0.20) interval = 18 + Math.random() * 15;
+
+      // Play typing sound ~every 1-3 chars (not on spaces/punctuation)
+      if (char && char.trim() && !'.,!?;:'.includes(char)) {
+        if (ts - s.lastTypeSoundAt > 60) {
+          typingSound.play();
+          s.lastTypeSoundAt = ts;
+        }
+      }
+
+      s.pos++;
+      s.nextFire = ts + interval;
+      setRevealedChars(s.pos);
+
+      if (s.pos < text.length) rafRef.current = requestAnimationFrame(step);
     };
+
     rafRef.current = requestAnimationFrame(step);
     return () => cancelAnimationFrame(rafRef.current!);
   }, [text, active]);
@@ -108,7 +145,7 @@ function SpaceBadge({ spaceId }: { spaceId: string }) {
   );
 }
 
-// ── Avatar with optional audio-playing rings ──────────────────────────────────
+// ── Avatar with ripple rings ──────────────────────────────────────────────────
 function AvatarRipple({ avatarUrl, isPlaying, hasAudio, typeColor, onClick }: {
   avatarUrl: string; isPlaying: boolean; hasAudio: boolean; typeColor: string; onClick?: () => void;
 }) {
@@ -116,7 +153,7 @@ function AvatarRipple({ avatarUrl, isPlaying, hasAudio, typeColor, onClick }: {
     <button type="button" onClick={onClick} disabled={!hasAudio}
       className="relative flex-shrink-0 focus:outline-none"
       style={{ cursor: hasAudio ? 'pointer' : 'default' }}>
-      {isPlaying && ['0s','0.45s','0.9s'].map((delay, i) => (
+      {isPlaying && ['0s', '0.45s', '0.9s'].map((delay, i) => (
         <span key={i} className="absolute inset-0 rounded-full pointer-events-none" style={{
           border: `1.5px solid ${typeColor}`,
           animationName: 'voiceRipple', animationDuration: '1.4s',
@@ -146,11 +183,12 @@ const TEXT_SIZES: Record<TextSize, string> = {
 
 export default function StreamCard({
   moment, phase, textSize = 'md', isPinned, enableVoiceAudio, autoPlayVoice,
-  onPass, onPin, onLetGo, onAudioDuration,
+  onPass, onPin, onLetGo, onAudioDuration, onVoiceFinished,
 }: Props) {
   const [visible, setVisible] = useState(false);
   const [voicePlaying, setVoicePlaying] = useState(false);
   const voiceElRef = useRef<HTMLAudioElement | null>(null);
+  const voiceEndedRef = useRef(false);
 
   const isDream = moment.type === 'dream';
   const typeColor = isDream ? '#c4b5fd' : '#fbbf24';
@@ -160,31 +198,58 @@ export default function StreamCard({
 
   // Typing effect only for text-only moments during reading phase
   const useTyping = !hasAudio && phase === 'reading';
-  const revealedChars = useTypingReveal(moment.body, useTyping, 0.06);
+  const revealedChars = useTypingReveal(moment.body, useTyping);
   const displayedBody = useTyping ? moment.body.slice(0, revealedChars) : moment.body;
 
-  // ── Voice audio ───────────────────────────────────────────────────────────
+  // ── Voice audio setup ─────────────────────────────────────────────────────
   useEffect(() => {
     if (!moment.audioUrl) return;
     const el = new Audio(moment.audioUrl);
-    el.onended = () => { setVoicePlaying(false); audioEngine.unduck(); };
-    el.onpause = () => { setVoicePlaying(false); audioEngine.unduck(); };
+    el.preload = 'auto';
+    voiceEndedRef.current = false;
+
     el.onloadedmetadata = () => {
-      if (el.duration && isFinite(el.duration) && el.duration > 0) onAudioDuration?.(el.duration);
+      if (el.duration && isFinite(el.duration) && el.duration > 0) {
+        onAudioDuration?.(el.duration);
+      }
     };
+
+    const handleEnd = () => {
+      setVoicePlaying(false);
+      audioEngine.unduck();
+      voiceEndedRef.current = true;
+      onVoiceFinished?.();
+    };
+
+    el.onended = handleEnd;
+    el.onpause = () => {
+      // Only trigger finished if naturally ended (not manual pause)
+      if (el.currentTime > 0 && Math.abs(el.currentTime - el.duration) < 0.5) {
+        handleEnd();
+      } else {
+        setVoicePlaying(false);
+        audioEngine.unduck();
+      }
+    };
+    el.onerror = () => { setVoicePlaying(false); audioEngine.unduck(); };
+
     voiceElRef.current = el;
-    return () => { el.pause(); el.src = ''; audioEngine.unduck(); };
+    return () => { el.pause(); el.src = ''; audioEngine.unduck(); voiceElRef.current = null; };
   }, [moment.audioUrl]);
 
+  // Auto-play voice when entering reading phase
   useEffect(() => {
     if (phase === 'reading' && autoPlayVoice && hasAudio && voiceElRef.current) {
       const el = voiceElRef.current;
       el.currentTime = 0;
       audioEngine.duck();
-      el.play().then(() => setVoicePlaying(true)).catch(() => audioEngine.unduck());
+      el.play()
+        .then(() => setVoicePlaying(true))
+        .catch(() => audioEngine.unduck());
     }
   }, [phase, autoPlayVoice, hasAudio]);
 
+  // Stop voice when moment leaves (but NOT during reading — let it finish)
   useEffect(() => {
     if (phase === 'leaving' || phase === 'gap') {
       voiceElRef.current?.pause();
@@ -196,8 +261,17 @@ export default function StreamCard({
   const toggleVoice = useCallback(() => {
     const el = voiceElRef.current;
     if (!el) return;
-    if (voicePlaying) { el.pause(); setVoicePlaying(false); audioEngine.unduck(); }
-    else { audioEngine.duck(); el.currentTime = 0; el.play().catch(() => audioEngine.unduck()); setVoicePlaying(true); }
+    if (voicePlaying) {
+      el.pause();
+      setVoicePlaying(false);
+      audioEngine.unduck();
+    } else {
+      audioEngine.duck();
+      el.currentTime = 0;
+      el.play()
+        .then(() => setVoicePlaying(true))
+        .catch(() => audioEngine.unduck());
+    }
   }, [voicePlaying]);
 
   // ── Card visibility transitions ───────────────────────────────────────────
@@ -272,17 +346,12 @@ export default function StreamCard({
             className={hasLongBody ? 'overflow-y-auto max-h-[52vh] no-scrollbar' : ''}
             style={{ overscrollBehavior: 'contain' }}
           >
-            {/* ── Photo (above text) ────────────────────────────────────── */}
+            {/* ── Photo ────────────────────────────────────────────────── */}
             {moment.polaroidUrl && (
               <div className="px-6 pt-5">
                 <div className="w-full rounded-xl overflow-hidden bg-black/20">
-                  <img
-                    src={moment.polaroidUrl}
-                    alt=""
-                    className="w-full object-cover max-h-52"
-                    draggable={false}
-                    style={{ display: 'block' }}
-                  />
+                  <img src={moment.polaroidUrl} alt="" className="w-full object-cover max-h-52"
+                    draggable={false} style={{ display: 'block' }} />
                 </div>
               </div>
             )}
@@ -290,10 +359,8 @@ export default function StreamCard({
             {/* ── Title ────────────────────────────────────────────────── */}
             {moment.title && (
               <div className="px-6 pt-4">
-                <h2
-                  className="text-lg font-semibold text-[#f0ebe0] leading-snug"
-                  style={{ fontFamily: isDream ? '"Playfair Display",Georgia,serif' : 'Inter,system-ui,sans-serif' }}
-                >
+                <h2 className="text-lg font-semibold text-[#f0ebe0] leading-snug"
+                  style={{ fontFamily: isDream ? '"Playfair Display",Georgia,serif' : 'Inter,system-ui,sans-serif' }}>
                   {moment.title}
                 </h2>
               </div>
@@ -301,17 +368,18 @@ export default function StreamCard({
 
             {/* ── Body ─────────────────────────────────────────────────── */}
             <div className={`px-6 ${moment.title ? 'pt-2' : 'pt-4'} pb-4`}>
-              <div
-                className={`${TEXT_SIZES[textSize]} text-[#f0ebe0]/90`}
-                style={{ fontFamily: bodyFont }}
-              >
+              <div className={`${TEXT_SIZES[textSize]} text-[#f0ebe0]/90`} style={{ fontFamily: bodyFont }}>
                 {hasAudio || !useTyping
                   ? renderMarkdown(moment.body)
                   : renderMarkdown(displayedBody)
                 }
                 {useTyping && revealedChars < moment.body.length && (
                   <span className="inline-block w-[2px] h-[1em] bg-current opacity-70 ml-px"
-                    style={{ verticalAlign: 'text-bottom', animationName: 'musicPulse', animationDuration: '0.8s', animationIterationCount: 'infinite', animationTimingFunction: 'step-end' }}
+                    style={{
+                      verticalAlign: 'text-bottom',
+                      animationName: 'musicPulse', animationDuration: '0.8s',
+                      animationIterationCount: 'infinite', animationTimingFunction: 'step-end',
+                    }}
                   />
                 )}
               </div>
@@ -354,7 +422,7 @@ export default function StreamCard({
             )}
           </div>
 
-          {/* ── Bottom controls: Pin + Pass ───────────────────────────── */}
+          {/* ── Pin + Pass ────────────────────────────────────────────────── */}
           <div className="flex items-center justify-between px-6 py-3 border-t border-white/7">
             {!isPinned ? (
               <button onClick={onPin}
@@ -369,12 +437,9 @@ export default function StreamCard({
                 <span>📌</span><span>Let go →</span>
               </button>
             )}
-
-            <button
-              onClick={onPass}
+            <button onClick={onPass}
               className="flex items-center gap-1.5 text-[12px] text-white/30 hover:text-white/60 transition-colors"
-              title="Pass — never show again"
-            >
+              title="Pass — never show again">
               <span>Pass</span>
               <span className="text-white/20">→</span>
             </button>

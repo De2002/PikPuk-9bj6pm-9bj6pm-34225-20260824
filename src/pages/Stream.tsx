@@ -1,6 +1,5 @@
-
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { StreamPhase, AtmosphereId, UserSettings } from '@/types';
+import { StreamPhase, AtmosphereId, UserSettings, Moment } from '@/types';
 import { useAuth } from '@/hooks/useAuth';
 import { useStream } from '@/hooks/useStream';
 import { useAtmosphere } from '@/hooks/useAtmosphere';
@@ -18,6 +17,8 @@ import AuthModal from '@/components/features/AuthModal';
 import Settings from '@/components/features/Settings';
 import AtmospherePanel from '@/components/features/AtmospherePanel';
 import DisplayPanel from '@/components/features/DisplayPanel';
+import PinnedExpansion from '@/components/features/PinnedExpansion';
+import SpaceExplorer from '@/components/features/SpaceExplorer';
 import StreamControls from '@/components/layout/StreamControls';
 import { toast } from 'sonner';
 
@@ -29,26 +30,40 @@ export default function Stream() {
   const { atmosphere, setAtmosphere } = useAtmosphere();
   const { displayId, setDisplay } = useDisplay();
 
-  const [phase, setPhase]                 = useState<StreamPhase>('gap');
-  const [isPinned, setIsPinned]           = useState(false);
+  const [phase, setPhase]                   = useState<StreamPhase>('gap');
+  const [isPinned, setIsPinned]             = useState(false);
+  const [showPinnedExpansion, setShowPinnedExpansion] = useState(false);
+  const [pinnedMoment, setPinnedMoment]     = useState<Moment | null>(null);
+  const [showSpaceExplorer, setShowSpaceExplorer] = useState(false);
   const [controlsVisible, setControlsVisible] = useState(true);
-  const [modal, setModal]                 = useState<Modal>('none');
-  // Report functionality removed from stream view — available via admin
-  // const [reportId, setReportId] = useState<string | null>(null);
+  const [modal, setModal]                   = useState<Modal>('none');
   const [isAudioPlaying, setIsAudioPlaying] = useState(false);
-  const [volume, setVolume]               = useState(0.5);
+  const [volume, setVolume]                 = useState(0.5);
   const [voiceDurationMs, setVoiceDurationMs] = useState(0);
+  // Track whether voice has finished to allow advancing
+  const voiceFinishedRef = useRef(false);
 
   const phaseRef  = useRef<ReturnType<typeof setTimeout>>();
   const idleRef   = useRef<ReturnType<typeof setTimeout>>();
   const pinnedRef = useRef(isPinned);
   pinnedRef.current = isPinned;
 
-  useEffect(() => { setVoiceDurationMs(0); }, [currentMoment?.id]);
+  useEffect(() => { setVoiceDurationMs(0); voiceFinishedRef.current = false; }, [currentMoment?.id]);
 
   const handleAudioDuration = useCallback((seconds: number) => {
-    setVoiceDurationMs(seconds * 1000 + 600);
+    // Add 400ms buffer after voice ends before advancing
+    setVoiceDurationMs(seconds * 1000 + 400);
   }, []);
+
+  const handleVoiceFinished = useCallback(() => {
+    voiceFinishedRef.current = true;
+    // If we're still in reading phase, advance now that voice finished
+    if (phase === 'reading' && !pinnedRef.current) {
+      clearTimeout(phaseRef.current);
+      // Small grace period after voice ends (1.2s) before leaving
+      phaseRef.current = setTimeout(() => setPhase('leaving'), 1200);
+    }
+  }, [phase]);
 
   useEffect(() => { if (user) setVolume(user.settings.volume); }, [user?.id, user?.settings.volume]);
 
@@ -64,7 +79,11 @@ export default function Stream() {
       phaseRef.current = setTimeout(() => setPhase('reading'), 850);
     } else if (phase === 'reading') {
       const textDur = calcReadingTime(currentMoment.body);
-      const dur = voiceDurationMs > 0 ? Math.max(voiceDurationMs, textDur) : textDur;
+      // If voice note exists, wait for voice to finish (handled by onVoiceFinished)
+      // Fall back to text reading time + voice duration estimate
+      const dur = voiceDurationMs > 0
+        ? Math.max(voiceDurationMs + 1200, textDur)
+        : textDur;
       phaseRef.current = setTimeout(() => setPhase('leaving'), dur);
     } else if (phase === 'leaving') {
       phaseRef.current = setTimeout(() => { nextMoment(); setPhase('gap'); }, 800);
@@ -72,22 +91,28 @@ export default function Stream() {
     return () => clearTimeout(phaseRef.current);
   }, [phase, currentMoment?.id, currentMoment?.body, isPinned, nextMoment, voiceDurationMs]);
 
-  // ── Pass immediately — skip current + permanent hide ─────────────────────
+  // ── Pass ──────────────────────────────────────────────────────────────────
   const handlePass = useCallback(() => {
     clearTimeout(phaseRef.current);
     setIsPinned(false);
+    setShowPinnedExpansion(false);
     passAndSkip().then(() => setPhase('gap'));
   }, [passAndSkip]);
 
-  // ── Pin / Let go ──────────────────────────────────────────────────────────
+  // ── Pin ───────────────────────────────────────────────────────────────────
   const handlePin = useCallback(() => {
     if (phase !== 'reading') return;
     clearTimeout(phaseRef.current);
     setIsPinned(true);
-  }, [phase]);
+    setPinnedMoment(currentMoment);
+    // Show the expansion after a brief moment
+    setTimeout(() => setShowPinnedExpansion(true), 300);
+  }, [phase, currentMoment]);
 
   const handleLetGo = useCallback(() => {
     setIsPinned(false);
+    setShowPinnedExpansion(false);
+    setPinnedMoment(null);
     setPhase('leaving');
   }, []);
 
@@ -139,6 +164,7 @@ export default function Stream() {
         addMoment(moment);
         clearTimeout(phaseRef.current);
         setIsPinned(false);
+        setShowPinnedExpansion(false);
         setPhase('gap');
       }
       setModal('none');
@@ -167,7 +193,6 @@ export default function Stream() {
     onPass: handlePass,
     onPin: handlePin,
     onLetGo: handleLetGo,
-    // onReport: () => setReportId(currentMoment!.id),
     neighbours: [prevNeighbour, nextNeighbour] as [typeof prevNeighbour, typeof nextNeighbour],
   };
 
@@ -206,6 +231,7 @@ export default function Stream() {
           onPin={handlePin}
           onLetGo={handleLetGo}
           onAudioDuration={handleAudioDuration}
+          onVoiceFinished={handleVoiceFinished}
         />
       )}
       {showContent && displayId === 'film' && (
@@ -229,8 +255,22 @@ export default function Stream() {
         />
       )}
 
+      {/* ── Pinned expansion overlay ── */}
+      {showPinnedExpansion && pinnedMoment && (
+        <PinnedExpansion
+          moment={pinnedMoment}
+          user={user}
+          onLetGo={handleLetGo}
+        />
+      )}
+
+      {/* ── Space explorer overlay ── */}
+      {showSpaceExplorer && (
+        <SpaceExplorer onClose={() => setShowSpaceExplorer(false)} />
+      )}
+
       <StreamControls
-        visible={controlsVisible}
+        visible={controlsVisible && !showPinnedExpansion && !showSpaceExplorer}
         user={user}
         atmosphere={atmosphere}
         displayId={displayId}
@@ -241,6 +281,7 @@ export default function Stream() {
         onDisplay={() => setModal('display')}
         onCompose={handleCompose}
         onSignIn={() => setModal('auth')}
+        onExplore={() => setShowSpaceExplorer(true)}
       />
 
       {/* ── Modals ── */}
@@ -273,7 +314,6 @@ export default function Stream() {
       {modal === 'display' && (
         <DisplayPanel current={displayId} onSelect={setDisplay} onClose={() => setModal('none')} />
       )}
-
     </div>
   );
 }

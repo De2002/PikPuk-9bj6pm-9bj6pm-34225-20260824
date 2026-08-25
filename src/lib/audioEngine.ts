@@ -1,4 +1,4 @@
-import { fetchActiveTrack } from './api';
+import { fetchActiveTrack, getAppSetting } from './api';
 
 // ── Active track URL cache ────────────────────────────────────────────────────
 let cachedUrl: string | null = null;
@@ -163,3 +163,52 @@ class PikPukAudioEngine {
 }
 
 export const audioEngine = new PikPukAudioEngine();
+
+// ── Typing sound engine ───────────────────────────────────────────────────────
+
+let typingSoundUrl: string | null = null;
+let typingFetchedAt = 0;
+
+async function getTypingSoundUrl(): Promise<string | null> {
+  const now = Date.now();
+  if (typingSoundUrl && now - typingFetchedAt < 10 * 60 * 1000) return typingSoundUrl;
+  try {
+    const url = await getAppSetting('typing_sound_url');
+    if (url) { typingSoundUrl = url; typingFetchedAt = now; }
+    return url;
+  } catch { return null; }
+}
+
+// Pre-fetch typing sound on load
+if (typeof window !== 'undefined') {
+  setTimeout(() => void getTypingSoundUrl(), 1500);
+}
+
+class TypingSound {
+  private pool: HTMLAudioElement[] = [];
+  private poolSize = 3;
+  private poolIdx = 0;
+
+  async prime() {
+    const url = await getTypingSoundUrl();
+    if (!url || this.pool.length > 0) return;
+    for (let i = 0; i < this.poolSize; i++) {
+      const el = new Audio(url);
+      el.preload = 'auto';
+      el.volume = 0.08;
+      this.pool.push(el);
+    }
+  }
+
+  play() {
+    if (this.pool.length === 0) { void this.prime(); return; }
+    const el = this.pool[this.poolIdx % this.pool.length];
+    this.poolIdx++;
+    try {
+      el.currentTime = 0;
+      el.play().catch(() => {});
+    } catch {}
+  }
+}
+
+export const typingSound = new TypingSound();

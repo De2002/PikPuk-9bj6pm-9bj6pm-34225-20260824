@@ -266,6 +266,150 @@ export async function deleteAudioTrack(track: AudioTrack): Promise<void> {
   if (error) throw new Error(error.message);
 }
 
+// ── Space explorer ──────────────────────────────────────────────────────────
+
+export async function fetchMomentsBySpace(
+  spaceId: string,
+  limit = 30
+): Promise<Moment[]> {
+  const { data, error } = await supabase
+    .from('moments')
+    .select('id, type, body, title, author_name, website_url, space, polaroid_url, audio_url, user_id, user_profiles!inner(avatar_url)')
+    .eq('moderation_status', 'approved')
+    .eq('status', 'active')
+    .eq('space', spaceId)
+    .order('created_at', { ascending: false })
+    .limit(limit);
+
+  if (error) { console.log('[api] fetchMomentsBySpace error', error.message); return []; }
+  if (!data || data.length === 0) return [];
+
+  const defaultAvatar = 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=80&h=80&fit=crop&crop=face';
+  const rows = data as unknown as Array<{
+    id: string; type: 'dream' | 'thought'; body: string; title: string | null;
+    author_name: string | null; website_url: string | null; space: string | null;
+    polaroid_url: string | null; audio_url: string | null; user_id: string;
+    user_profiles: { avatar_url: string | null } | null;
+  }>;
+  return rows.map(r => ({
+    id: r.id, type: r.type, body: r.body,
+    title: r.title ?? undefined,
+    authorName: r.author_name ?? undefined,
+    websiteUrl: r.website_url ?? undefined,
+    space: (r.space ?? 'general') as import('@/types').SpaceId,
+    polaroidUrl: r.polaroid_url ?? undefined,
+    audioUrl: r.audio_url ?? undefined,
+    avatarUrl: (r.user_profiles as { avatar_url: string | null } | null)?.avatar_url ?? defaultAvatar,
+  }));
+}
+
+// ── Responses ──────────────────────────────────────────────────────────────────
+
+export interface Response {
+  id: string;
+  momentId: string;
+  userId: string;
+  body: string;
+  authorName?: string;
+  createdAt: string;
+  avatarUrl?: string;
+}
+
+export async function fetchResponses(momentId: string): Promise<Response[]> {
+  const { data, error } = await supabase
+    .from('responses')
+    .select('id, moment_id, user_id, body, author_name, created_at, user_profiles!inner(avatar_url)')
+    .eq('moment_id', momentId)
+    .order('created_at', { ascending: true })
+    .limit(50);
+  if (error) { console.log('[api] fetchResponses error', error.message); return []; }
+  const rows = data as unknown as Array<{
+    id: string; moment_id: string; user_id: string; body: string;
+    author_name: string | null; created_at: string;
+    user_profiles: { avatar_url: string | null } | null;
+  }>;
+  const defaultAvatar = 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=80&h=80&fit=crop&crop=face';
+  return rows.map(r => ({
+    id: r.id, momentId: r.moment_id, userId: r.user_id, body: r.body,
+    authorName: r.author_name ?? undefined,
+    createdAt: r.created_at,
+    avatarUrl: (r.user_profiles as { avatar_url: string | null } | null)?.avatar_url ?? defaultAvatar,
+  }));
+}
+
+export async function addResponse(params: {
+  momentId: string; userId: string; body: string; authorName?: string;
+}): Promise<Response | null> {
+  const { data, error } = await supabase
+    .from('responses')
+    .insert({
+      moment_id: params.momentId,
+      user_id: params.userId,
+      body: params.body,
+      author_name: params.authorName ?? null,
+    })
+    .select('id, moment_id, user_id, body, author_name, created_at')
+    .single();
+  if (error) { console.log('[api] addResponse error', error.message); return null; }
+  return {
+    id: data.id, momentId: data.moment_id, userId: data.user_id,
+    body: data.body, authorName: data.author_name ?? undefined,
+    createdAt: data.created_at,
+  };
+}
+
+// ── Reactions ──────────────────────────────────────────────────────────────────
+
+export async function fetchReactionCount(momentId: string): Promise<number> {
+  const { count, error } = await supabase
+    .from('reactions')
+    .select('id', { count: 'exact', head: true })
+    .eq('moment_id', momentId);
+  if (error) { console.log('[api] fetchReactionCount error', error.message); return 0; }
+  return count ?? 0;
+}
+
+export async function toggleReaction(momentId: string, userId: string): Promise<'added' | 'removed'> {
+  const { data: existing } = await supabase
+    .from('reactions')
+    .select('id')
+    .eq('moment_id', momentId)
+    .eq('user_id', userId)
+    .maybeSingle();
+  if (existing) {
+    await supabase.from('reactions').delete().eq('id', existing.id);
+    return 'removed';
+  }
+  await supabase.from('reactions').insert({ moment_id: momentId, user_id: userId });
+  return 'added';
+}
+
+export async function hasUserReacted(momentId: string, userId: string): Promise<boolean> {
+  const { data } = await supabase
+    .from('reactions')
+    .select('id')
+    .eq('moment_id', momentId)
+    .eq('user_id', userId)
+    .maybeSingle();
+  return !!data;
+}
+
+// ── App settings (typing sound etc) ──────────────────────────────────────────────
+
+export async function getAppSetting(key: string): Promise<string | null> {
+  const { data } = await supabase
+    .from('app_settings')
+    .select('value')
+    .eq('key', key)
+    .maybeSingle();
+  return (data as { value: string | null } | null)?.value ?? null;
+}
+
+export async function setAppSetting(key: string, value: string): Promise<void> {
+  const { error } = await supabase.from('app_settings').upsert({ key, value, updated_at: new Date().toISOString() });
+  if (error) throw new Error(error.message);
+}
+
 // ── Reports ──────────────────────────────────────────────────────────────────
 
 export async function submitReport(reporterId: string, momentId: string, reason: string) {
